@@ -19,6 +19,9 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	v1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -141,9 +144,12 @@ var _ = Describe("Test Proxy endpoints", func() {
 		})
 	})
 
-	Describe("Test group-based RBAC", Label("proxy-dex"), func() {
-		It("should grant access to namespaces the user's groups are bound to", func() {
-			token, err := ExtractTokenForUser(proxyClient, "user1@konflux.dev", "password")
+	Describe("Test group impersonation ceiling", Label("proxy-dex"), func() {
+		const idpGroupUser = "user1@konflux.dev"
+		const idpGroupName = "team-alpha"
+
+		It("should succeed for a user who has IdP groups without forwarding them", func() {
+			token, err := ExtractTokenForUser(proxyClient, idpGroupUser, "password")
 			Expect(err).NotTo(HaveOccurred())
 
 			request, err := http.NewRequest("GET", proxyURL("/api/k8s/api/v1/namespaces"), nil)
@@ -156,29 +162,108 @@ var _ = Describe("Test Proxy endpoints", func() {
 
 			body, err := io.ReadAll(response.Body)
 			Expect(err).NotTo(HaveOccurred())
+			// A 403 here means the proxy still impersonates IdP groups the SA
+			// is no longer allowed to impersonate.
 			expectProxyHTTPStatus(response, body, http.StatusOK, "/api/k8s/api/v1/namespaces")
 		})
 
-		It("should pass groups from ID token as Impersonate-Group headers", func() {
-			token, err := ExtractTokenForUser(proxyClient, "user1@konflux.dev", "password")
+		It("should ignore IdP group RoleBindings and honor system:authenticated", func(ctx context.Context) {
+			token, err := ExtractTokenForUser(proxyClient, idpGroupUser, "password")
 			Expect(err).NotTo(HaveOccurred())
 
-			sarBody := `{"apiVersion":"authorization.k8s.io/v1","kind":"SelfSubjectAccessReview","spec":{"resourceAttributes":{"verb":"list","resource":"namespaces"}}}`
-			request, err := http.NewRequest("POST",
-				proxyURL("/api/k8s/apis/authorization.k8s.io/v1/selfsubjectaccessreviews"),
-				strings.NewReader(sarBody))
-			Expect(err).NotTo(HaveOccurred())
-			request.Header.Set("Authorization", "Bearer "+token)
-			request.Header.Set("Content-Type", "application/json")
+			nsName := fmt.Sprintf("proxy-group-ceiling-%d", GinkgoRandomSeed())
+			ns := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: nsName}}
+			Expect(proxyClient.Create(ctx, ns)).To(Succeed())
+			DeferCleanup(func(ctx context.Context) {
+				err := proxyClient.Delete(ctx, ns)
+				Expect(crclient.IgnoreNotFound(err)).NotTo(HaveOccurred())
+			})
 
-			response, err := proxyHTTPClient.Do(request)
-			Expect(err).NotTo(HaveOccurred())
-			defer response.Body.Close()
+			groupRB := &rbacv1.RoleBinding{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "idp-group-view",
+					Namespace: nsName,
+				},
+				RoleRef: rbacv1.RoleRef{
+					APIGroup: rbacv1.GroupName,
+					Kind:     "ClusterRole",
+					Name:     "view",
+				},
+				Subjects: []rbacv1.Subject{{
+					APIGroup: rbacv1.GroupName,
+					Kind:     rbacv1.GroupKind,
+					Name:     idpGroupName,
+				}},
+			}
+			Expect(proxyClient.Create(ctx, groupRB)).To(Succeed())
+			DeferCleanup(func(ctx context.Context) {
+				err := proxyClient.Delete(ctx, groupRB)
+				Expect(crclient.IgnoreNotFound(err)).NotTo(HaveOccurred())
+			})
 
-			body, err := io.ReadAll(response.Body)
-			Expect(err).NotTo(HaveOccurred())
-			expectProxyHTTPStatus(response, body, http.StatusCreated,
-				"/api/k8s/apis/authorization.k8s.io/v1/selfsubjectaccessreviews")
+			configMapsPath := fmt.Sprintf("/api/k8s/api/v1/namespaces/%s/configmaps", nsName)
+			By("denying kube API access granted only to an IdP group")
+			Eventually(func(g Gomega) {
+				code, body := proxyGETStatusAndBodyG(g, configMapsPath, token)
+				g.Expect(code).To(Equal(http.StatusForbidden),
+					"IdP group RoleBinding must not grant access through the proxy: %s", string(body))
+			}).WithTimeout(30 * time.Second).WithPolling(2 * time.Second).Should(Succeed())
+
+			By("omitting the namespace from the namespace-lister response")
+			Eventually(func(g Gomega) {
+				code, body := proxyGETStatusAndBodyG(g, "/api/k8s/api/v1/namespaces", token)
+				g.Expect(code).To(Equal(http.StatusOK), string(body))
+				g.Expect(namespaceListContains(body, nsName)).To(BeFalse(),
+					"namespace-lister must not treat IdP groups as authorization subjects")
+			}).WithTimeout(30 * time.Second).WithPolling(2 * time.Second).Should(Succeed())
+
+			authRB := &rbacv1.RoleBinding{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "system-authenticated-view",
+					Namespace: nsName,
+				},
+				RoleRef: rbacv1.RoleRef{
+					APIGroup: rbacv1.GroupName,
+					Kind:     "ClusterRole",
+					Name:     "view",
+				},
+				Subjects: []rbacv1.Subject{{
+					APIGroup: rbacv1.GroupName,
+					Kind:     rbacv1.GroupKind,
+					Name:     "system:authenticated",
+				}},
+			}
+			Expect(proxyClient.Create(ctx, authRB)).To(Succeed())
+			DeferCleanup(func(ctx context.Context) {
+				err := proxyClient.Delete(ctx, authRB)
+				Expect(crclient.IgnoreNotFound(err)).NotTo(HaveOccurred())
+			})
+
+			By("allowing kube API access bound to system:authenticated")
+			Eventually(func(g Gomega) {
+				code, body := proxyGETStatusAndBodyG(g, configMapsPath, token)
+				g.Expect(code).To(Equal(http.StatusOK), string(body))
+			}).WithTimeout(30 * time.Second).WithPolling(2 * time.Second).Should(Succeed())
+
+			By("including the namespace once system:authenticated is bound")
+			Eventually(func(g Gomega) {
+				code, body := proxyGETStatusAndBodyG(g, "/api/k8s/api/v1/namespaces", token)
+				g.Expect(code).To(Equal(http.StatusOK), string(body))
+				g.Expect(namespaceListContains(body, nsName)).To(BeTrue(),
+					"namespace-lister should honor system:authenticated RoleBindings")
+			}).WithTimeout(30 * time.Second).WithPolling(2 * time.Second).Should(Succeed())
+
+			By("removing the system:authenticated binding")
+			Expect(proxyClient.Delete(ctx, authRB)).To(Succeed())
+			Eventually(func(g Gomega) {
+				err := proxyClient.Get(ctx, crclient.ObjectKeyFromObject(authRB), &rbacv1.RoleBinding{})
+				g.Expect(apierrors.IsNotFound(err)).To(BeTrue(), "unexpected error: %v", err)
+			}).WithTimeout(30 * time.Second).WithPolling(2 * time.Second).Should(Succeed())
+
+			Eventually(func(g Gomega) {
+				code, body := proxyGETStatusAndBodyG(g, configMapsPath, token)
+				g.Expect(code).To(Equal(http.StatusForbidden), string(body))
+			}).WithTimeout(30 * time.Second).WithPolling(2 * time.Second).Should(Succeed())
 		})
 	})
 
@@ -336,6 +421,10 @@ var _ = Describe("Test Proxy endpoints", func() {
 						"echo should receive Impersonate-User header")
 					g.Expect(lastHeaders["Impersonate-User"][0]).To(Equal(expectedImpersonateUser()),
 						"Impersonate-User should match the authenticated user")
+					g.Expect(lastHeaders).To(HaveKey("Impersonate-Group"),
+						"echo should receive Impersonate-Group header")
+					g.Expect(lastHeaders["Impersonate-Group"]).To(Equal([]string{"system:authenticated"}),
+						"Impersonate-Group must be only system:authenticated")
 				}).WithTimeout(2 * time.Minute).WithPolling(5 * time.Second).Should(Succeed())
 			} else {
 				expectEndpointRouted(kitePath, token)
@@ -377,6 +466,10 @@ var _ = Describe("Test Proxy endpoints", func() {
 					g.Expect(lastHeaders).To(HaveKey("Impersonate-User"),
 						"echo should receive Impersonate-User header")
 					g.Expect(lastHeaders["Impersonate-User"][0]).To(Equal(expectedImpersonateUser()))
+					g.Expect(lastHeaders).To(HaveKey("Impersonate-Group"),
+						"echo should receive Impersonate-Group header")
+					g.Expect(lastHeaders["Impersonate-Group"]).To(Equal([]string{"system:authenticated"}),
+						"Impersonate-Group must be only system:authenticated")
 				}).WithTimeout(2 * time.Minute).WithPolling(5 * time.Second).Should(Succeed())
 			} else {
 				expectEndpointRouted(kubearchivePath, token)
@@ -551,6 +644,41 @@ func echoGetG(g Gomega, path, token string) map[string][]string {
 	var echo echoResponseBody
 	g.Expect(json.Unmarshal(body, &echo)).To(Succeed(), "failed to parse echo response: %s", string(body))
 	return echo.Headers
+}
+
+// proxyGETStatusAndBodyG performs an authenticated GET for use inside Eventually.
+func proxyGETStatusAndBodyG(g Gomega, path, token string) (int, []byte) {
+	GinkgoHelper()
+	request, err := http.NewRequest("GET", proxyURL(path), nil)
+	g.Expect(err).NotTo(HaveOccurred())
+	request.Header.Set("Authorization", "Bearer "+token)
+
+	response, err := proxyHTTPClient.Do(request)
+	g.Expect(err).NotTo(HaveOccurred())
+	defer response.Body.Close()
+
+	body, err := io.ReadAll(response.Body)
+	g.Expect(err).NotTo(HaveOccurred())
+	return response.StatusCode, body
+}
+
+func namespaceListContains(body []byte, name string) bool {
+	var nsList struct {
+		Items []struct {
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(body, &nsList); err != nil {
+		return false
+	}
+	for _, item := range nsList.Items {
+		if item.Metadata.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func echoGet(path, token string) map[string][]string {

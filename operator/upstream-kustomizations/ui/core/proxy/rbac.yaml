@@ -10,8 +10,16 @@ kind: ClusterRole
 metadata:
   name: konflux-proxy
 rules:
+# Impersonate any authenticated user identity. Group impersonation is limited
+# to system:authenticated until constrained impersonation is available on the
+# target OpenShift version:
+# https://kubernetes.io/docs/reference/access-authn-authz/user-impersonation/#constrained-impersonation
 - apiGroups: [""]
-  resources: ["users", "groups"]
+  resources: ["users"]
+  verbs: ["impersonate"]
+- apiGroups: [""]
+  resources: ["groups"]
+  resourceNames: ["system:authenticated"]
   verbs: ["impersonate"]
 - apiGroups: ["authorization.k8s.io"]
   resources: ["localsubjectaccessreviews"]
